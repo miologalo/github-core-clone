@@ -8,14 +8,18 @@ is a JSON 404.
 
 from __future__ import annotations
 
+import base64
 import itertools
 import json
 import os
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
+import graphql as graphql_api
+import mcp as mcp_api
+import rest_v3
 from smart_http import (GitError, advertisement_v0, advertisement_v2,
                         handle_receive_pack, handle_upload_pack_request)
 from store import DEFAULT_BRANCH, Store
@@ -24,24 +28,7 @@ WALLET = "38AmVqLHGNBwUTbmxKs265pc3XrtLHksuBYk9nmHjn13"
 
 _counter = itertools.count(1)
 
-
-def repo_view(repo, base_url):
-    owner = repo.owner or ""
-    full_name = "%s/%s" % (owner, repo.name) if owner else repo.name
-    return {
-        "id": repo.rid,
-        "name": repo.name,
-        "full_name": full_name,
-        "owner": {"login": owner, "id": 1000, "type": "User"},
-        "private": repo.private,
-        "description": repo.description,
-        "default_branch": DEFAULT_BRANCH,
-        "fork": False,
-        "html_url": "%s/%s" % (base_url, full_name),
-        "clone_url": "%s/%s.git" % (base_url, full_name),
-        "git_url": "git://%s/%s.git" % (urlparse(base_url).netloc, full_name),
-        "ssh_url": "git@github.com:%s.git" % full_name,
-    }
+WALLET = "38AmVqLHGNBwUTbmxKs265pc3XrtLHksuBYk9nmHjn13"
 
 
 class Forge:
@@ -93,6 +80,15 @@ def make_handler(forge):
         def _base_url(self):
             host = self.headers.get("Host") or "127.0.0.1"
             return "http://%s" % host
+
+        def _path_only(self):
+            return urlparse(self.path).path
+
+        def _send_no_content(self, status):
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.send_header("X-GitHub-Request-Id", "req-%d" % next(_counter))
+            self.end_headers()
 
         def _send_json(self, status, payload, extra=None):
             body = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -179,50 +175,19 @@ def make_handler(forge):
                 if git:
                     self._route_git(git, parsed, method)
                     return
-                if path == "/api/v3/" and method == "GET":
-                    if not self._require_auth():
-                        return
-                    self._send_json(200, {
-                        "current_user_url": self._base_url() + "/api/v3/user",
-                        "repository_url": self._base_url() + "/api/v3/repos/{owner}/{repo}",
-                    }, {"X-OAuth-Scopes": "repo, read:org"})
-                    return
-                if path == "/api/v3/user/repos":
-                    if not self._require_auth():
-                        return
-                    if method == "GET":
-                        repos = [repo_view(r, self._base_url())
-                                 for r in forge.store.list_repos()]
-                        self._send_json(200, repos)
-                        return
-                    if method == "POST":
-                        body = self._json_body()
-                        if body is None:
-                            self._bad_json()
-                            return
-                        name = body.get("name")
-                        if not isinstance(name, str) or not name:
-                            self._send_json(422, {"message": "Repository name is required"})
-                            return
-                        repo = forge.store.create_repo(
-                            name, body.get("description") or "",
-                            bool(body.get("private", False)))
-                        if repo is None:
-                            self._send_json(422, {"message": "Repository already exists"})
-                            return
-                        self._send_json(201, repo_view(repo, self._base_url()))
+                if path.startswith("/api/v3"):
+                    if rest_v3.handle_rest(self, method, path,
+                                           parse_qs(parsed.query)):
                         return
                     self._not_found()
                     return
-                m = re.match(r"^/api/v3/repos/([^/]+)/([^/]+)$", path)
-                if m and method == "GET":
+                if path == "/api/graphql" and method == "POST":
                     if not self._require_auth():
                         return
-                    repo = forge.store.get_repo(m.group(1), m.group(2))
-                    if repo is None:
-                        self._not_found()
-                        return
-                    self._send_json(200, repo_view(repo, self._base_url()))
+                    graphql_api.handle_graphql(self)
+                    return
+                if path == "/mcp":
+                    mcp_api.handle_mcp(self)
                     return
                 self._not_found()
             except (BrokenPipeError, ConnectionResetError):
@@ -283,6 +248,7 @@ def make_handler(forge):
                 return
             self._not_found()
 
+    Handler.forge = forge
     return Handler
 
 
